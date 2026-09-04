@@ -134,17 +134,54 @@ void loop() {
   // =========================================================================
   // NORMAL STATE MACHINE
   // =========================================================================
+  static CycleState lastState = (CycleState)-1;
+  if (currentState != lastState) {
+    Serial.print("--- ENTERING STATE: ");
+    switch (currentState) {
+    case STATE_IDLE:
+      Serial.println("IDLE");
+      break;
+    case STATE_CHECK_WATER:
+      Serial.println("CHECK_WATER");
+      break;
+    case STATE_LOCK_DOOR:
+      Serial.println("LOCK_DOOR");
+      break;
+    case STATE_PURGE:
+      Serial.println("PURGE");
+      break;
+    case STATE_HEATING:
+      Serial.println("HEATING");
+      break;
+    case STATE_STERILIZING:
+      Serial.println("STERILIZING");
+      break;
+    case STATE_EXHAUST:
+      Serial.println("EXHAUST");
+      break;
+    case STATE_COMPLETE:
+      Serial.println("COMPLETE");
+      break;
+    case STATE_EMERGENCY_SHUTDOWN:
+      Serial.println("EMERGENCY_SHUTDOWN");
+      break;
+    }
+    lastState = currentState;
+  }
+
   switch (currentState) {
 
   case STATE_CHECK_WATER:
-    Serial.println("[STATE] Checking Water Level...");
     if (hasWater) {
-      Serial.println("[STATE] Engaging Door Lock...");
       digitalWrite(RELAY_DOOR_LOCK, RELAY_ON);
       stateStartTime = millis();
       currentState = STATE_LOCK_DOOR;
     } else {
-      Serial.println("ALERT: Insufficient water. Awaiting refill...");
+      static unsigned long lastWaterAlert = 0;
+      if (millis() - lastWaterAlert > 2000) {
+        Serial.println("ALERT: Insufficient water. Awaiting refill...");
+        lastWaterAlert = millis();
+      }
     }
     break;
 
@@ -157,7 +194,6 @@ void loop() {
     break;
 
   case STATE_PURGE:
-    Serial.println("[STATE] Purging cool air from vessel...");
     digitalWrite(RELAY_EXHAUST, RELAY_ON);
     digitalWrite(RELAY_HEATER, RELAY_ON);
 
@@ -169,7 +205,6 @@ void loop() {
     break;
 
   case STATE_HEATING:
-    Serial.println("[STATE] Pressurizing and Heating...");
     digitalWrite(RELAY_HEATER, RELAY_ON);
     digitalWrite(RELAY_STEAM_INLET, RELAY_ON);
 
@@ -181,8 +216,6 @@ void loop() {
     break;
 
   case STATE_STERILIZING:
-    Serial.println("[STATE] Sterilization Hold Running...");
-
     // Regulate temperature (Hysteresis band: 120°C - 121°C)
     if (tempC < TARGET_TEMP_C) {
       digitalWrite(RELAY_HEATER, RELAY_ON);
@@ -206,7 +239,6 @@ void loop() {
     break;
 
   case STATE_EXHAUST:
-    Serial.println("[STATE] Depressurizing and Draining...");
     digitalWrite(RELAY_EXHAUST, RELAY_ON);
     digitalWrite(RELAY_DRAIN, RELAY_ON);
 
@@ -261,7 +293,13 @@ void loop() {
       digitalWrite(RELAY_DOOR_LOCK, RELAY_OFF);
     }
 
-    Serial.println("SYSTEM IN EMERGENCY SHUTDOWN. Manual reset required.");
+    {
+      static unsigned long lastEmergencyAlert = 0;
+      if (millis() - lastEmergencyAlert > 2000) {
+        Serial.println("SYSTEM IN EMERGENCY SHUTDOWN. Manual reset required.");
+        lastEmergencyAlert = millis();
+      }
+    }
     if (digitalRead(btnResetPin) == LOW) {
       Serial.println("Reset button pressed. Returning to IDLE.");
       currentState = STATE_IDLE;
@@ -270,12 +308,14 @@ void loop() {
   }
 
   // --- Telemetry Display ---
-  Serial.print("T: ");
-  Serial.print(tempC, 1);
-  Serial.print(" °C | P: ");
-  Serial.print(pressurePsi, 2);
-  Serial.print(" PSI | Water: ");
-  Serial.println(hasWater ? "OK" : "EMPTY");
-
-  delay(500); // 500ms cycle gives rapid feedback to over-pressure scenarios
+  static unsigned long lastTelemetryTime = 0;
+  if (millis() - lastTelemetryTime >= 1000) {
+    lastTelemetryTime = millis();
+    Serial.print("T: ");
+    Serial.print(tempC, 1);
+    Serial.print(" °C | P: ");
+    Serial.print(pressurePsi, 2);
+    Serial.print(" PSI | Water: ");
+    Serial.println(hasWater ? "OK" : "EMPTY");
+  }
 }
