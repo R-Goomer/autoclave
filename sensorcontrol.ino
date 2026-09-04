@@ -18,7 +18,7 @@ const int RELAY_AIR_VALVE = 40;
 const int RELAY_HEATER = 39;
 const int RELAY_DOOR_LOCK = 38;
 
-// --- Relay Logic Configuration (Active LOW: LOW = ON, HIGH = OFF) ---
+// --- Relay Logic Configuration
 const int RELAY_ON = HIGH;
 const int RELAY_OFF = LOW;
 
@@ -139,6 +139,9 @@ void loop() {
   case STATE_CHECK_WATER:
     Serial.println("[STATE] Checking Water Level...");
     if (hasWater) {
+      Serial.println("[STATE] Engaging Door Lock...");
+      digitalWrite(RELAY_DOOR_LOCK, RELAY_ON);
+      stateStartTime = millis();
       currentState = STATE_LOCK_DOOR;
     } else {
       Serial.println("ALERT: Insufficient water. Awaiting refill...");
@@ -146,12 +149,11 @@ void loop() {
     break;
 
   case STATE_LOCK_DOOR:
-    Serial.println("[STATE] Engaging Door Lock...");
-    digitalWrite(RELAY_DOOR_LOCK, RELAY_ON);
-    delay(2000);
-
-    stateStartTime = millis();
-    currentState = STATE_PURGE;
+    // Non-blocking wait for 2 seconds to ensure door is securely locked
+    if (millis() - stateStartTime >= 2000) {
+      stateStartTime = millis();
+      currentState = STATE_PURGE;
+    }
     break;
 
   case STATE_PURGE:
