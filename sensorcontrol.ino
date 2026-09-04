@@ -2,8 +2,8 @@
 #include <Wire.h>
 
 // --- Input Pins ---
-const int btnStartPin = 1;
-const int btnResetPin = 2;
+const int btnStartPin = 14;
+const int btnResetPin = 13;
 
 // --- Sensor Pins ---
 const int lm35Pin = 5;
