@@ -48,3 +48,11 @@
 
 <br>**R6: Door Closer** (GPIO 19) | R1, R4, R5 |
 | **7. Cycle Complete** | Pressure: `≤ 1.0 PSI` | `STATE_COMPLETE` $\rightarrow$ `STATE_IDLE` | *None* (Door unlocks) | All Relays OFF |
+
+
+
+Temp testing params
+const float TARGET_TEMP_C = 120.0;
+const float TARGET_PSI = 10.0;
+const unsigned long PURGE_TIME = 20000; // 20 sec
+const unsigned long HOLD_TIME = 1UL * 60UL * 1000UL;
