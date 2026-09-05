@@ -1,4 +1,3 @@
-#include <Adafruit_BMP085.h>
 #include <Wire.h>
 
 // --- Input Pins ---
@@ -9,12 +8,13 @@ const int btnResetPin = 13;
 const int lm35Pin = 5;
 const int waterLevelPin = 4;
 const int waterThreshold = 1850; // Above 1850 = Water detected
+// Potentiometer on GPIO 6 — simulates chamber pressure (-1 to 30 PSI gauge)
+// Wiring: pot wiper → GPIO 6, ends to 3.3 V and GND
+const int simPressurePin = 6;
 
 // --- Relay Pins (Top to Bottom) ---
-// NOTE: RELAY_STEAM_INLET is PHYSICALLY REMOVED from the design.
-//       The pin is driven LOW at startup and never energised again.
-//       Heater alone generates all steam and pressure.
-const int RELAY_STEAM_INLET = 6; // UNUSED — kept for pin mapping only
+// NOTE: RELAY_STEAM_INLET physically removed. GPIO 6 is now simPressurePin.
+const int RELAY_STEAM_INLET = -1; // REMOVED — do not drive
 const int RELAY_DRAIN = 42;
 const int RELAY_EXHAUST = 41;
 const int RELAY_AIR_VALVE =
@@ -78,8 +78,7 @@ enum CycleState {
 
 CycleState currentState = STATE_IDLE;
 unsigned long stateStartTime = 0;
-float baselinePressurePa =
-    101325.0; // Ambient baseline set on every START press
+// baselinePressurePa removed — pot gives gauge PSI directly
 
 // --- Purge Sub-State ---
 // purgePhase  0,2,4  = vacuum pull  (even)
@@ -91,15 +90,14 @@ unsigned long purgePhaseStart = 0;
 // --- Sterilizing Heater State (hysteresis latch) ---
 bool sterilizeHeaterOn = false;
 
-Adafruit_BMP085 bmp;
+// BMP085/BMP180 removed — pressure now read from simulation potentiometer
 
 // =============================================================================
 // HELPERS
 // =============================================================================
 
 void allRelaysOff() {
-  digitalWrite(RELAY_STEAM_INLET,
-               RELAY_OFF); // Always OFF — steam inlet removed
+  // RELAY_STEAM_INLET is -1 (removed) — do not write
   digitalWrite(RELAY_DRAIN, RELAY_OFF);
   digitalWrite(RELAY_EXHAUST, RELAY_OFF);
   digitalWrite(RELAY_AIR_VALVE, RELAY_OFF);
@@ -125,8 +123,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  int relayPins[] = {RELAY_STEAM_INLET, RELAY_DRAIN,  RELAY_EXHAUST,
-                     RELAY_AIR_VALVE,   RELAY_HEATER, RELAY_DOOR_LOCK};
+  int relayPins[] = {RELAY_DRAIN, RELAY_EXHAUST, RELAY_AIR_VALVE, RELAY_HEATER,
+                     RELAY_DOOR_LOCK};
 
   for (int pin : relayPins) {
     digitalWrite(pin, RELAY_OFF); // Safe state before setting direction
@@ -138,12 +136,7 @@ void setup() {
 
   analogSetPinAttenuation(lm35Pin, ADC_11db);
   analogSetPinAttenuation(waterLevelPin, ADC_11db);
-
-  Wire.begin(8, 9);
-  if (!bmp.begin()) {
-    Serial.println("CRITICAL: BMP180 sensor initialization failed!");
-    currentState = STATE_EMERGENCY_SHUTDOWN;
-  }
+  analogSetPinAttenuation(simPressurePin, ADC_11db); // Pressure simulation pot
 
   Serial.println("==============================================");
   Serial.println(" Class B Autoclave Controller — Heater-Only  ");
@@ -172,10 +165,14 @@ void loop() {
 
   // --- Continuous Metric Acquisition ---
   float tempC = analogReadMilliVolts(lm35Pin) / 10.0;
-  float currentPressurePa = bmp.readPressure();
-  float pressurePsi = (currentPressurePa - baselinePressurePa) / 6894.76;
-  if (pressurePsi < 0.0)
-    pressurePsi = 0.0; // Clamp minor ambient drift
+
+  // Pressure simulation: pot wiper on GPIO 6
+  // Centre (1650 mV / 50% travel) = 0 PSI gauge  ← safe idle position
+  // Full CCW (0 mV)               = -30 PSI       ← deep vacuum side
+  // Full CW  (3300 mV)            = +30 PSI       ← sterilizing side
+  float pressurePsi =
+      ((float)(analogReadMilliVolts(simPressurePin) - 1650) / 1650.0f) * 30.0f;
+
   bool hasWater = (analogRead(waterLevelPin) > waterThreshold);
 
   // ===========================================================================
@@ -250,19 +247,11 @@ void loop() {
   case STATE_IDLE:
     allRelaysOff();
     if (digitalRead(btnStartPin) == LOW) {
-      Serial.println("Start pressed — sampling atmospheric baseline...");
-
-      // 2-second averaged baseline (20 × 100 ms)
-      long sum = 0;
-      for (int i = 0; i < 20; i++) {
-        sum += bmp.readPressure();
-        delay(100);
-      }
-      baselinePressurePa = sum / 20.0;
-
-      Serial.print("Atmospheric baseline set: ");
-      Serial.print(baselinePressurePa / 6894.76, 2);
-      Serial.println(" psia  (0.00 psig)");
+      Serial.println(
+          "Start pressed — pot reads gauge PSI directly, no baseline needed.");
+      Serial.print("Current sim pressure: ");
+      Serial.print(pressurePsi, 2);
+      Serial.println(" PSI gauge");
       Serial.println("Initiating sterilization cycle...");
       currentState = STATE_CHECK_WATER;
     }
@@ -296,9 +285,9 @@ void loop() {
       Serial.println(" PSI");
       Serial.print("Vacuum pull: ");
       Serial.print(VACUUM_PULL_MS / 1000);
-      Serial.print("s  |  Steam inject: ");
+      Serial.print("s (timed)  |  Steam inject: ");
       Serial.print(STEAM_INJECT_MS / 1000);
-      Serial.println("s  |  3 pulses");
+      Serial.println("s (timed)  |  3 pulses  [sim pressure via pot]");
 
       // Initialise purge sub-state
       purgePhase = 0;
