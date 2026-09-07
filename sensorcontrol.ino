@@ -20,8 +20,7 @@ const int simPressurePin = 6;
 const int RELAY_STEAM_INLET = -1; // REMOVED — do not drive
 const int RELAY_DRAIN = 42;
 const int RELAY_EXHAUST = 41;
-const int RELAY_AIR_VALVE =
-    40; // Controls vacuum pump + air/vacuum valve (same relay)
+const int RELAY_AIR_VALVE = 40; // Controls vacuum pump + air/vacuum valve (same relay)
 const int RELAY_HEATER = 39;
 const int RELAY_DOOR_LOCK = 38;
 
@@ -75,7 +74,7 @@ const int VACUUM_PULSE_COUNT = 3;
 const float VACUUM_TARGET_PSI = -0.8;
 
 // --- Global Safety Limits ---
-const float MAX_SAFE_PSI = 20.0;     // Immediate blowoff threshold
+const float MAX_SAFE_PSI = 30.0;     // Immediate blowoff threshold
 const float MAX_SAFE_TEMP_C = 150.0; // Emergency heater cutoff threshold
 
 // =============================================================================
