@@ -70,10 +70,9 @@ const int TEMP_FILTER_WINDOW = 5;
 // BMP180 cannot read deep vacuum (~10 kPa abs), so pulse depth is enforced by
 // time.
 const int VACUUM_PULSE_COUNT = 3;
-const unsigned long VACUUM_PULL_MS =
-    30000; // 30 s — vacuum pump run per pulse (~-0.8 bar by time)
-const unsigned long STEAM_INJECT_MS =
-    20000; // 20 s — heater-on steam injection between pulses
+// Sensor-based purge: vacuum pull ends when gauge pressure reaches this value
+// (or deeper). Pot simulates -2 to +30 PSI gauge; -0.8 PSI ≈ light vacuum.
+const float VACUUM_TARGET_PSI = -0.8;
 
 // --- Global Safety Limits ---
 const float MAX_SAFE_PSI = 20.0;     // Immediate blowoff threshold
@@ -104,7 +103,6 @@ unsigned long stateStartTime = 0;
 // purgePhase  1,3,5  = steam inject (odd)
 // purgePhase  6      = await target temp + PSI after 3rd cycle
 int purgePhase = 0;
-unsigned long purgePhaseStart = 0;
 
 // --- Sterilizing Heater State (PID + time-proportional SSR) ---
 double pidInput = 0.0;  // filtered temperature (°C)
@@ -387,61 +385,69 @@ void loop() {
       Serial.print("C / ");
       Serial.print(TARGET_PSI, 1);
       Serial.println(" PSI");
-      Serial.print("Vacuum pull: ");
-      Serial.print(VACUUM_PULL_MS / 1000);
-      Serial.print("s (timed)  |  Steam inject: ");
-      Serial.print(STEAM_INJECT_MS / 1000);
-      Serial.println("s (timed)  |  3 pulses  [sim pressure via pot]");
+      Serial.print("Vacuum pull: until ");
+      Serial.print(VACUUM_TARGET_PSI, 1);
+      Serial.print(" PSI (sensor)  |  Steam inject: until ");
+      Serial.print(TARGET_TEMP_C, 1);
+      Serial.println("C (sensor)  |  3 pulses  [sim pressure via pot]");
 
       // Initialise purge sub-state
       purgePhase = 0;
-      purgePhaseStart = millis();
       stateStartTime = millis();
       currentState = STATE_PURGE;
     }
     break;
 
   // --------------------------------------------------------------------------
-  // CLASS B FRACTIONATED VACUUM PURGE
+  // CLASS B FRACTIONATED VACUUM PURGE  (sensor-based)
   //
   //  Phases 0→5  (3 vacuum-pull / steam-inject pairs):
   //    Even (0,2,4): RELAY_AIR_VALVE ON  (vacuum pump + valve)  —
-  //    VACUUM_PULL_MS Odd  (1,3,5): RELAY_AIR_VALVE OFF, RELAY_HEATER ON —
-  //    STEAM_INJECT_MS
+  //    runs until pressurePsi <= VACUUM_TARGET_PSI (-0.8 PSI)
+  //    Odd  (1,3,5): RELAY_AIR_VALVE OFF, RELAY_HEATER ON —
+  //    runs until tempC >= TARGET_TEMP_C
   //
   //  Phase 6:  All 3 pulses done.  Heater ON, pump OFF.
   //            Await TARGET_TEMP_C AND TARGET_PSI simultaneously.
   //            → advances to STATE_STERILIZING.
   // --------------------------------------------------------------------------
   case STATE_PURGE: {
-    unsigned long phaseElapsed = millis() - purgePhaseStart;
 
     if (purgePhase < VACUUM_PULSE_COUNT * 2) {
       bool isVacuumPhase = (purgePhase % 2 == 0);
-      unsigned long phaseDuration =
-          isVacuumPhase ? VACUUM_PULL_MS : STEAM_INJECT_MS;
 
       if (isVacuumPhase) {
         // Vacuum pump + air/vacuum valve ON; heater OFF
         digitalWrite(RELAY_AIR_VALVE, RELAY_ON);
         digitalWrite(RELAY_HEATER, RELAY_OFF);
+
+        // Sensor-based: advance once target vacuum depth is reached
+        if (pressurePsi <= VACUUM_TARGET_PSI) {
+          purgePhase++;
+          Serial.print("Purge: vacuum reached ");
+          Serial.print(pressurePsi, 2);
+          Serial.print(" PSI → entering phase ");
+          Serial.print(purgePhase);
+          Serial.print(" [");
+          Serial.print(purgePhaseName(purgePhase));
+          Serial.println("]");
+        }
       } else {
         // Pump OFF; heater ON — boil water to inject steam
         digitalWrite(RELAY_AIR_VALVE, RELAY_OFF);
         digitalWrite(RELAY_HEATER, RELAY_ON);
-      }
 
-      if (phaseElapsed >= phaseDuration) {
-        purgePhase++;
-        purgePhaseStart = millis();
-
-        Serial.print("Purge: phase ");
-        Serial.print(purgePhase - 1);
-        Serial.print(" complete → entering phase ");
-        Serial.print(purgePhase);
-        Serial.print(" [");
-        Serial.print(purgePhaseName(purgePhase));
-        Serial.println("]");
+        // Sensor-based: advance once sterilizing temp is reached
+        if (tempC >= TARGET_TEMP_C) {
+          purgePhase++;
+          Serial.print("Purge: temp reached ");
+          Serial.print(tempC, 1);
+          Serial.print("C → entering phase ");
+          Serial.print(purgePhase);
+          Serial.print(" [");
+          Serial.print(purgePhaseName(purgePhase));
+          Serial.println("]");
+        }
       }
 
     } else {
@@ -611,21 +617,26 @@ void loop() {
     case STATE_PURGE: {
       if (purgePhase < VACUUM_PULSE_COUNT * 2) {
         bool isVacuumPhase = (purgePhase % 2 == 0);
-        unsigned long phaseDuration =
-            isVacuumPhase ? VACUUM_PULL_MS : STEAM_INJECT_MS;
-        unsigned long phaseElapsed = millis() - purgePhaseStart;
-        unsigned long rem = (phaseElapsed < phaseDuration)
-                                ? (phaseDuration - phaseElapsed) / 1000
-                                : 0;
         Serial.print("Purge Pulse ");
         Serial.print(purgeCurrentPulse(purgePhase));
         Serial.print("/");
         Serial.print(VACUUM_PULSE_COUNT);
         Serial.print(" [");
         Serial.print(purgePhaseName(purgePhase));
-        Serial.print("] ");
-        Serial.print(rem);
-        Serial.println("s left");
+        if (isVacuumPhase) {
+          Serial.print("  P:");
+          Serial.print(pressurePsi, 2);
+          Serial.print(" / target ");
+          Serial.print(VACUUM_TARGET_PSI, 1);
+          Serial.print(" PSI");
+        } else {
+          Serial.print("  T:");
+          Serial.print(tempC, 1);
+          Serial.print(" / target ");
+          Serial.print(TARGET_TEMP_C, 1);
+          Serial.print("C");
+        }
+        Serial.println("]");
       } else {
         Serial.print("Purge: awaiting target  T>=");
         Serial.print(TARGET_TEMP_C, 1);
