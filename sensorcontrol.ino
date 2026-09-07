@@ -1,4 +1,4 @@
-## autoclave project
+//autoclave project
 
 #include <Wire.h>
 #include <PID_v1.h> // Arduino PID Library (Brett Beauregard)
@@ -271,11 +271,10 @@ void loop() {
   filteredTempC = filterTemp(tempC); // smoothed for PID / telemetry
 
   // Pressure simulation: pot wiper on GPIO 6
-  // Centre (1650 mV / 50% travel) = 0 PSI gauge  ← safe idle position
-  // Full CCW (0 mV)               = -30 PSI       ← deep vacuum side
+  // Full CCW (0 mV)               = -2 PSI       ← deep vacuum side
   // Full CW  (3300 mV)            = +30 PSI       ← sterilizing side
-  float pressurePsi =
-      ((float)(analogReadMilliVolts(simPressurePin) - 1650) / 1650.0f) * 30.0f;
+  float pressurePsi = -2.0 + (analogReadMilliVolts(simPressurePin) - 656.0) * (27.0 / (4095.0 - 656.0));
+  pressurePsi = constrain(pressurePsi, -2.0, 25.0);
 
   bool hasWater = (analogRead(waterLevelPin) > waterThreshold);
 
@@ -285,8 +284,9 @@ void loop() {
 
   // 1. OVER-PRESSURE INTERLOCK
   if (pressurePsi >= MAX_SAFE_PSI) {
-    Serial.println(
-        "EMERGENCY: OVER-PRESSURE! Opening exhaust & killing heater.");
+    Serial.print(
+        "EMERGENCY: OVER-PRESSURE! Opening exhaust & killing heater: ");
+    Serial.println(pressurePsi, 2);
     digitalWrite(RELAY_HEATER, RELAY_OFF);
     digitalWrite(RELAY_EXHAUST, RELAY_ON);
     currentState = STATE_EMERGENCY_SHUTDOWN;
