@@ -1,4 +1,7 @@
+## autoclave project
+
 #include <Wire.h>
+#include <PID_v1.h> // Arduino PID Library (Brett Beauregard)
 
 // --- Input Pins ---
 const int btnStartPin = 14;
@@ -36,15 +39,31 @@ const float TARGET_PSI = 15.0; // Legal minimum sterilizing pressure (PSI gauge)
 const unsigned long HOLD_TIME =
     15UL * 60UL * 1000UL; // 15-minute sterilizing hold
 
-// --- Sterilizing Heater Hysteresis Band ---
-// Heater turns ON  when temp falls TO or BELOW STERILIZE_HEATER_SOFT_LIMIT_C
-// (target + 2 °C → 123 °C) Heater turns OFF when temp rises TO or ABOVE
-// STERILIZE_HEATER_HARD_OFF_C   (target + 4 °C → 125 °C) FLOOR:  if temp drops
-// BELOW TARGET_TEMP_C  OR  PSI drops BELOW TARGET_PSI  → EMERGENCY SHUTDOWN
-const float STERILIZE_HEATER_SOFT_LIMIT_C =
-    TARGET_TEMP_C + 2.0f; // 123 °C — heater turns ON  at or below here
-const float STERILIZE_HEATER_HARD_OFF_C =
-    TARGET_TEMP_C + 4.0f; // 125 °C — heater turns OFF at or above here
+// --- Sterilizing Heater Control (PID + time-proportional SSR) ---
+// PID holds the chamber at STERILIZE_SETPOINT_C (target + 1 °C margin).
+// The PID output (0–100%) is converted to a binary SSR duty cycle over a
+// fixed SSR_CYCLE_MS period (SSR minimum cycle time = 2 s).
+const float STERILIZE_SETPOINT_C = TARGET_TEMP_C + 1.0f; // 122 °C
+
+// PID tuning gains (heater + LM35 + chamber thermal mass)
+const double PID_KP = 40.0;
+const double PID_KI = 0.35;
+const double PID_KD = 0.0; // Derivative OFF — LM35 too noisy; rely on I
+
+// PID output is a duty cycle in percent (0–100)
+const double PID_OUT_MIN = 0.0;
+const double PID_OUT_MAX = 100.0;
+
+// Time-proportional SSR parameters
+const unsigned long SSR_CYCLE_MS = 2000UL; // SSR minimum cycle time (2 s)
+const unsigned long SSR_MIN_PULSE_MS =
+    200UL; // Minimum ON/OFF pulse to avoid relay chatter
+
+// PID sample interval (1 s — plenty for a heater thermal mass)
+const unsigned long PID_SAMPLE_MS = 1000UL;
+
+// Temperature filter — moving average window (smooths LM35 noise for PID)
+const int TEMP_FILTER_WINDOW = 5;
 
 // --- Class B Fractionated Vacuum Purge Parameters ---
 // Three alternating cycles of:  vacuum pull  →  heater-on steam inject
@@ -87,8 +106,22 @@ unsigned long stateStartTime = 0;
 int purgePhase = 0;
 unsigned long purgePhaseStart = 0;
 
-// --- Sterilizing Heater State (hysteresis latch) ---
-bool sterilizeHeaterOn = false;
+// --- Sterilizing Heater State (PID + time-proportional SSR) ---
+double pidInput = 0.0;  // filtered temperature (°C)
+double pidOutput = 0.0; // PID output duty cycle (0–100 %)
+double pidSetpoint = STERILIZE_SETPOINT_C;
+PID sterilizePID(&pidInput, &pidOutput, &pidSetpoint, PID_KP, PID_KI, PID_KD,
+                 DIRECT);
+
+// Time-proportional SSR state
+unsigned long ssrCycleStart = 0; // start of current SSR cycle (ms)
+bool ssrOn = false;              // whether heater is ON within this cycle
+bool pidArmed = false;           // PID active only during STERILIZING
+
+// Temperature moving-average filter
+float tempFilterBuf[TEMP_FILTER_WINDOW] = {0};
+int tempFilterIdx = 0;
+float filteredTempC = 0.0;
 
 // BMP085/BMP180 removed — pressure now read from simulation potentiometer
 
@@ -116,6 +149,61 @@ const char *purgePhaseName(int phase) {
 int purgeCurrentPulse(int phase) { return (phase / 2) + 1; }
 
 // =============================================================================
+// TEMPERATURE FILTER  (moving average — smooths LM35 noise for the PID)
+// =============================================================================
+float filterTemp(float rawC) {
+  tempFilterBuf[tempFilterIdx] = rawC;
+  tempFilterIdx = (tempFilterIdx + 1) % TEMP_FILTER_WINDOW;
+
+  float sum = 0.0f;
+  for (int i = 0; i < TEMP_FILTER_WINDOW; i++)
+    sum += tempFilterBuf[i];
+  return sum / (float)TEMP_FILTER_WINDOW;
+}
+
+// =============================================================================
+// TIME-PROPORTIONAL SSR DRIVER
+// =============================================================================
+// Converts a PID duty cycle (0–100 %) into a binary SSR ON/OFF pattern over a
+// fixed SSR_CYCLE_MS period. Enforces a minimum pulse to avoid relay chatter.
+// Call every loop() iteration; returns the desired heater relay state.
+bool driveSSR(double dutyPercent) {
+  unsigned long now = millis();
+
+  // Clamp duty to [0,100]
+  if (dutyPercent < 0.0)
+    dutyPercent = 0.0;
+  if (dutyPercent > 100.0)
+    dutyPercent = 100.0;
+
+  // Start a fresh cycle
+  if (now - ssrCycleStart >= SSR_CYCLE_MS) {
+    ssrCycleStart = now;
+    ssrOn = (dutyPercent > 0.0);
+  }
+
+  // Compute ON duration for this cycle (with minimum-pulse floor)
+  unsigned long onMs = (unsigned long)((dutyPercent / 100.0) *
+                                       (double)SSR_CYCLE_MS);
+  if (onMs > 0 && onMs < SSR_MIN_PULSE_MS)
+    onMs = SSR_MIN_PULSE_MS;
+
+  unsigned long elapsed = now - ssrCycleStart;
+
+  if (ssrOn) {
+    // Turn OFF once the ON window elapses (or at cycle end)
+    if (elapsed >= onMs)
+      ssrOn = false;
+  } else {
+    // Stay OFF for the remainder of the cycle
+    if (elapsed >= SSR_CYCLE_MS)
+      ssrOn = true; // next cycle begins
+  }
+
+  return ssrOn;
+}
+
+// =============================================================================
 // SETUP
 // =============================================================================
 
@@ -138,6 +226,12 @@ void setup() {
   analogSetPinAttenuation(waterLevelPin, ADC_11db);
   analogSetPinAttenuation(simPressurePin, ADC_11db); // Pressure simulation pot
 
+  // --- Configure PID controller ---
+  sterilizePID.SetOutputLimits(PID_OUT_MIN, PID_OUT_MAX);
+  sterilizePID.SetSampleTime(PID_SAMPLE_MS);
+  sterilizePID.SetMode(MANUAL); // Armed (AUTOMATIC) only on sterilizing entry
+  sterilizePID.SetTunings(PID_KP, PID_KI, PID_KD);
+
   Serial.println("==============================================");
   Serial.println(" Class B Autoclave Controller — Heater-Only  ");
   Serial.println(" Steam inlet valve DISABLED (physically removed)");
@@ -146,11 +240,20 @@ void setup() {
   Serial.print("C / ");
   Serial.print(TARGET_PSI, 1);
   Serial.println(" PSI");
-  Serial.print(" Heater band: ");
-  Serial.print(STERILIZE_HEATER_SOFT_LIMIT_C, 1);
-  Serial.print("C ON → ");
-  Serial.print(STERILIZE_HEATER_HARD_OFF_C, 1);
-  Serial.println("C OFF");
+  Serial.print(" PID setpoint: ");
+  Serial.print(STERILIZE_SETPOINT_C, 1);
+  Serial.println("C (target + 1C margin)");
+  Serial.print(" PID gains: Kp=");
+  Serial.print(PID_KP, 1);
+  Serial.print(" Ki=");
+  Serial.print(PID_KI, 2);
+  Serial.print(" Kd=");
+  Serial.println(PID_KD, 1);
+  Serial.print(" SSR time-proportional: ");
+  Serial.print(SSR_CYCLE_MS / 1000);
+  Serial.print("s cycle, min pulse ");
+  Serial.print(SSR_MIN_PULSE_MS);
+  Serial.println("ms");
   Serial.print(" Floor safety: < ");
   Serial.print(TARGET_TEMP_C, 1);
   Serial.println("C or < target PSI → EMERGENCY");
@@ -165,6 +268,7 @@ void loop() {
 
   // --- Continuous Metric Acquisition ---
   float tempC = analogReadMilliVolts(lm35Pin) / 10.0;
+  filteredTempC = filterTemp(tempC); // smoothed for PID / telemetry
 
   // Pressure simulation: pot wiper on GPIO 6
   // Centre (1650 mV / 50% travel) = 0 PSI gauge  ← safe idle position
@@ -353,9 +457,13 @@ void loop() {
         Serial.println(
             " PSI — sterilizing conditions reached after 3rd cycle.");
 
-        // Safe entry into sterilizing: heater OFF, reset hysteresis latch
+        // Safe entry into sterilizing: heater OFF, arm PID fresh
         digitalWrite(RELAY_HEATER, RELAY_OFF);
-        sterilizeHeaterOn = false;
+        ssrOn = false;
+        ssrCycleStart = millis();
+        pidInput = filteredTempC;
+        sterilizePID.SetMode(AUTOMATIC); // Arm PID (anti-windup: fresh I term)
+        pidArmed = true;
         stateStartTime = millis();
         currentState = STATE_STERILIZING;
       }
@@ -366,10 +474,10 @@ void loop() {
   // --------------------------------------------------------------------------
   // STERILIZING
   //
-  //  Hysteresis band:
-  //    Heater ON   when tempC <=  STERILIZE_HEATER_SOFT_LIMIT_C  (123 °C)
-  //    Heater OFF  when tempC >=  STERILIZE_HEATER_HARD_OFF_C    (125 °C)
-  //    Between 123–125 °C: maintain current state (hysteresis — no hunting)
+  //  PID + time-proportional SSR control:
+  //    - PID holds filtered temp at STERILIZE_SETPOINT_C (122 °C)
+  //    - PID output (0–100 %) → SSR duty cycle over SSR_CYCLE_MS (2 s)
+  //    - Anti-windup: PID armed fresh on entry; output clamped 0–100 %
   //
   //  Floor safety (checked first, every cycle):
   //    tempC < TARGET_TEMP_C  OR  pressurePsi < TARGET_PSI  → EMERGENCY
@@ -386,36 +494,30 @@ void loop() {
       Serial.println(
           " PSI — below legal minimum. Stopping & awaiting manual reset.");
       digitalWrite(RELAY_HEATER, RELAY_OFF);
-      sterilizeHeaterOn = false;
+      ssrOn = false;
+      pidArmed = false;
+      sterilizePID.SetMode(MANUAL);
       currentState = STATE_EMERGENCY_SHUTDOWN;
       break;
     }
 
-    // 2. Hysteresis-band heater control
-    if (sterilizeHeaterOn) {
-      // Currently heating — turn OFF only when hard-off limit is reached
-      if (tempC >= STERILIZE_HEATER_HARD_OFF_C) {
-        sterilizeHeaterOn = false;
-        Serial.print("Sterilize: heater OFF — reached ");
-        Serial.print(STERILIZE_HEATER_HARD_OFF_C, 1);
-        Serial.println("C hard limit");
-      }
+    // 2. PID + time-proportional SSR heater control
+    if (pidArmed) {
+      pidInput = filteredTempC;
+      sterilizePID.Compute(); // updates pidOutput (0–100 %) at sample rate
+      bool heaterOn = driveSSR(pidOutput);
+      digitalWrite(RELAY_HEATER, heaterOn ? RELAY_ON : RELAY_OFF);
     } else {
-      // Currently coasting — turn ON when temp drops to soft limit or below
-      if (tempC <= STERILIZE_HEATER_SOFT_LIMIT_C) {
-        sterilizeHeaterOn = true;
-        Serial.print("Sterilize: heater ON — temp at/below ");
-        Serial.print(STERILIZE_HEATER_SOFT_LIMIT_C, 1);
-        Serial.println("C soft limit");
-      }
+      digitalWrite(RELAY_HEATER, RELAY_OFF);
     }
-    digitalWrite(RELAY_HEATER, sterilizeHeaterOn ? RELAY_ON : RELAY_OFF);
 
     // 3. Hold-time complete → exhaust
     if (millis() - stateStartTime >= HOLD_TIME) {
       Serial.println("Sterilizing hold time complete. Opening exhaust.");
       digitalWrite(RELAY_HEATER, RELAY_OFF);
-      sterilizeHeaterOn = false;
+      ssrOn = false;
+      pidArmed = false;
+      sterilizePID.SetMode(MANUAL);
       currentState = STATE_EXHAUST;
     }
     break;
@@ -464,7 +566,9 @@ void loop() {
       Serial.println("Reset pressed. Returning to IDLE.");
       // Clear purge sub-state so a fresh cycle starts cleanly
       purgePhase = 0;
-      sterilizeHeaterOn = false;
+      ssrOn = false;
+      pidArmed = false;
+      sterilizePID.SetMode(MANUAL);
       currentState = STATE_IDLE;
     }
     break;
@@ -536,13 +640,14 @@ void loop() {
       unsigned long holdRemaining =
           (elapsed < HOLD_TIME) ? (HOLD_TIME - elapsed) / 1000 : 0;
       Serial.print("Sterilizing [Heater:");
-      Serial.print(sterilizeHeaterOn ? "ON " : "OFF");
-      Serial.print("  band:");
-      Serial.print(STERILIZE_HEATER_SOFT_LIMIT_C, 0);
-      Serial.print("–");
-      Serial.print(STERILIZE_HEATER_HARD_OFF_C, 0);
-      Serial.print("C");
-      Serial.print("  floor:");
+      Serial.print(ssrOn ? "ON " : "OFF");
+      Serial.print("  PID:");
+      Serial.print(pidOutput, 0);
+      Serial.print("%  set:");
+      Serial.print(STERILIZE_SETPOINT_C, 1);
+      Serial.print("C  T:");
+      Serial.print(filteredTempC, 1);
+      Serial.print("C  floor:");
       Serial.print(TARGET_TEMP_C, 0);
       Serial.print("C/");
       Serial.print(TARGET_PSI, 0);
