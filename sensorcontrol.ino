@@ -145,6 +145,131 @@ const char *purgePhaseName(int phase) {
 // Returns the 1-based pulse number for telemetry (1–3)
 int purgeCurrentPulse(int phase) { return (phase / 2) + 1; }
 
+// Returns a human-readable label for the current cycle state
+const char *stateName(CycleState s) {
+  switch (s) {
+  case STATE_IDLE:
+    return "IDLE";
+  case STATE_CHECK_WATER:
+    return "CHECK_WATER";
+  case STATE_LOCK_DOOR:
+    return "LOCK_DOOR";
+  case STATE_PURGE:
+    return "PURGE";
+  case STATE_STERILIZING:
+    return "STERILIZING";
+  case STATE_EXHAUST:
+    return "EXHAUST";
+  case STATE_COMPLETE:
+    return "COMPLETE";
+  case STATE_EMERGENCY_SHUTDOWN:
+    return "EMERGENCY_SHUTDOWN";
+  }
+  return "UNKNOWN";
+}
+
+// =============================================================================
+// TELEMETRY  (single JSON structure, filled in as the cycle progresses)
+// =============================================================================
+// One struct is reused for the whole cycle. Fields that don't apply to the
+// current stage keep their key but are emitted as `null` in the final JSON.
+struct Telemetry {
+  // --- Always populated ---
+  const char *state;
+  float tempC;
+  float pressurePsi;
+  bool hasWater;
+
+  // --- Purge ---
+  bool hasPurge;
+  int purgePhase;
+  const char *purgePhaseName;
+  int purgePulse;
+  float vacuumTargetPsi;
+  float steamTargetTempC;
+
+  // --- Sterilizing ---
+  bool hasSterilizing;
+  float pidOutput;
+  bool ssrOn;
+  float pidSetpoint;
+  float filteredTempC;
+  unsigned long holdRemaining;
+
+  // --- Door lock ---
+  bool doorLocked;
+
+  // --- Emergency ---
+  bool hasEmergency;
+  const char *emergencyReason;
+};
+
+Telemetry telemetry;
+
+// Emits the single JSON object for the whole cycle. Unset fields → null.
+void printTelemetryJson() {
+  Serial.print("{\"state\":\"");
+  Serial.print(telemetry.state);
+  Serial.print("\",\"tempC\":");
+  Serial.print(telemetry.tempC, 1);
+  Serial.print(",\"pressurePsi\":");
+  Serial.print(telemetry.pressurePsi, 2);
+  Serial.print(",\"hasWater\":");
+  Serial.print(telemetry.hasWater ? "true" : "false");
+
+  // Purge
+  Serial.print(",\"purge\":");
+  if (telemetry.hasPurge) {
+    Serial.print("{\"phase\":");
+    Serial.print(telemetry.purgePhase);
+    Serial.print(",\"phaseName\":\"");
+    Serial.print(telemetry.purgePhaseName);
+    Serial.print("\",\"pulse\":");
+    Serial.print(telemetry.purgePulse);
+    Serial.print(",\"vacuumTargetPsi\":");
+    Serial.print(telemetry.vacuumTargetPsi, 1);
+    Serial.print(",\"steamTargetTempC\":");
+    Serial.print(telemetry.steamTargetTempC, 1);
+    Serial.print("}");
+  } else {
+    Serial.print("null");
+  }
+
+  // Sterilizing
+  Serial.print(",\"sterilizing\":");
+  if (telemetry.hasSterilizing) {
+    Serial.print("{\"pidOutput\":");
+    Serial.print(telemetry.pidOutput, 0);
+    Serial.print(",\"ssrOn\":");
+    Serial.print(telemetry.ssrOn ? "true" : "false");
+    Serial.print(",\"pidSetpoint\":");
+    Serial.print(telemetry.pidSetpoint, 1);
+    Serial.print(",\"filteredTempC\":");
+    Serial.print(telemetry.filteredTempC, 1);
+    Serial.print(",\"holdRemaining\":");
+    Serial.print(telemetry.holdRemaining);
+    Serial.print("}");
+  } else {
+    Serial.print("null");
+  }
+
+  // Door lock
+  Serial.print(",\"doorLocked\":");
+  Serial.print(telemetry.doorLocked ? "true" : "false");
+
+  // Emergency
+  Serial.print(",\"emergency\":");
+  if (telemetry.hasEmergency) {
+    Serial.print("{\"reason\":\"");
+    Serial.print(telemetry.emergencyReason);
+    Serial.print("\"}");
+  } else {
+    Serial.print("null");
+  }
+
+  Serial.println("}");
+}
+
 // =============================================================================
 // TEMPERATURE FILTER  (moving average — smooths LM35 noise for the PID)
 // =============================================================================
@@ -231,7 +356,6 @@ void setup() {
 
   Serial.println("==============================================");
   Serial.println(" Class B Autoclave Controller — Heater-Only  ");
-  Serial.println(" Steam inlet valve DISABLED (physically removed)");
   Serial.print(" Sterilizing target: ");
   Serial.print(TARGET_TEMP_C, 1);
   Serial.print("C / ");
@@ -281,9 +405,8 @@ void loop() {
 
   // 1. OVER-PRESSURE INTERLOCK
   if (pressurePsi >= MAX_SAFE_PSI) {
-    Serial.print(
-        "EMERGENCY: OVER-PRESSURE! Opening exhaust & killing heater: ");
-    Serial.println(pressurePsi, 2);
+    telemetry.hasEmergency = true;
+    telemetry.emergencyReason = "OVER-PRESSURE";
     digitalWrite(RELAY_HEATER, RELAY_OFF);
     digitalWrite(RELAY_EXHAUST, RELAY_ON);
     currentState = STATE_EMERGENCY_SHUTDOWN;
@@ -291,7 +414,8 @@ void loop() {
 
   // 2. OVER-TEMPERATURE INTERLOCK
   if (tempC >= MAX_SAFE_TEMP_C) {
-    Serial.println("EMERGENCY: OVER-TEMPERATURE! Shutting down heater.");
+    telemetry.hasEmergency = true;
+    telemetry.emergencyReason = "OVER-TEMPERATURE";
     digitalWrite(RELAY_HEATER, RELAY_OFF);
     currentState = STATE_EMERGENCY_SHUTDOWN;
   }
@@ -299,7 +423,8 @@ void loop() {
   // 3. DRY-RUN PROTECTION (heater can be active in PURGE and STERILIZING)
   if (!hasWater &&
       (currentState == STATE_PURGE || currentState == STATE_STERILIZING)) {
-    Serial.println("EMERGENCY: WATER LOSS DURING RUN! Immediate cutoff.");
+    telemetry.hasEmergency = true;
+    telemetry.emergencyReason = "WATER LOSS";
     digitalWrite(RELAY_HEATER, RELAY_OFF);
     currentState = STATE_EMERGENCY_SHUTDOWN;
   }
@@ -309,33 +434,6 @@ void loop() {
   // ===========================================================================
   static CycleState lastState = (CycleState)-1;
   if (currentState != lastState) {
-    Serial.print("--- ENTERING STATE: ");
-    switch (currentState) {
-    case STATE_IDLE:
-      Serial.println("IDLE");
-      break;
-    case STATE_CHECK_WATER:
-      Serial.println("CHECK_WATER");
-      break;
-    case STATE_LOCK_DOOR:
-      Serial.println("LOCK_DOOR");
-      break;
-    case STATE_PURGE:
-      Serial.println("PURGE");
-      break;
-    case STATE_STERILIZING:
-      Serial.println("STERILIZING");
-      break;
-    case STATE_EXHAUST:
-      Serial.println("EXHAUST");
-      break;
-    case STATE_COMPLETE:
-      Serial.println("COMPLETE");
-      break;
-    case STATE_EMERGENCY_SHUTDOWN:
-      Serial.println("EMERGENCY_SHUTDOWN");
-      break;
-    }
     lastState = currentState;
   }
 
@@ -348,12 +446,9 @@ void loop() {
   case STATE_IDLE:
     allRelaysOff();
     if (digitalRead(btnStartPin) == LOW) {
-      Serial.println(
-          "Start pressed — pot reads gauge PSI directly, no baseline needed.");
-      Serial.print("Current sim pressure: ");
-      Serial.print(pressurePsi, 2);
-      Serial.println(" PSI gauge");
-      Serial.println("Initiating sterilization cycle...");
+      // Reset telemetry for a fresh cycle
+      telemetry = Telemetry{};
+      telemetry.state = stateName(currentState);
       currentState = STATE_CHECK_WATER;
     }
     break;
@@ -364,12 +459,6 @@ void loop() {
       digitalWrite(RELAY_DOOR_LOCK, RELAY_ON);
       stateStartTime = millis();
       currentState = STATE_LOCK_DOOR;
-    } else {
-      static unsigned long lastWaterAlert = 0;
-      if (millis() - lastWaterAlert > 2000) {
-        Serial.println("ALERT: Insufficient water. Awaiting refill...");
-        lastWaterAlert = millis();
-      }
     }
     break;
 
@@ -377,19 +466,6 @@ void loop() {
   case STATE_LOCK_DOOR:
     // Non-blocking 2-second wait for door solenoid to fully engage
     if (millis() - stateStartTime >= 2000) {
-      Serial.println(
-          "Door locked. Starting Class B fractionated vacuum purge.");
-      Serial.print("Purge params: target ");
-      Serial.print(TARGET_TEMP_C, 1);
-      Serial.print("C / ");
-      Serial.print(TARGET_PSI, 1);
-      Serial.println(" PSI");
-      Serial.print("Vacuum pull: until ");
-      Serial.print(VACUUM_TARGET_PSI, 1);
-      Serial.print(" PSI (sensor)  |  Steam inject: until ");
-      Serial.print(TARGET_TEMP_C, 1);
-      Serial.println("C (sensor)  |  3 pulses  [sim pressure via pot]");
-
       // Initialise purge sub-state
       purgePhase = 0;
       stateStartTime = millis();
@@ -423,13 +499,6 @@ void loop() {
         // Sensor-based: advance once target vacuum depth is reached
         if (pressurePsi <= VACUUM_TARGET_PSI) {
           purgePhase++;
-          Serial.print("Purge: vacuum reached ");
-          Serial.print(pressurePsi, 2);
-          Serial.print(" PSI → entering phase ");
-          Serial.print(purgePhase);
-          Serial.print(" [");
-          Serial.print(purgePhaseName(purgePhase));
-          Serial.println("]");
         }
       } else {
         // Pump OFF; heater ON — boil water to inject steam
@@ -439,13 +508,6 @@ void loop() {
         // Sensor-based: advance once sterilizing temp is reached
         if (tempC >= TARGET_TEMP_C) {
           purgePhase++;
-          Serial.print("Purge: temp reached ");
-          Serial.print(tempC, 1);
-          Serial.print("C → entering phase ");
-          Serial.print(purgePhase);
-          Serial.print(" [");
-          Serial.print(purgePhaseName(purgePhase));
-          Serial.println("]");
         }
       }
 
@@ -455,13 +517,6 @@ void loop() {
       digitalWrite(RELAY_HEATER, RELAY_ON);
 
       if (tempC >= TARGET_TEMP_C && pressurePsi >= TARGET_PSI) {
-        Serial.print("Purge complete: ");
-        Serial.print(tempC, 1);
-        Serial.print("C / ");
-        Serial.print(pressurePsi, 2);
-        Serial.println(
-            " PSI — sterilizing conditions reached after 3rd cycle.");
-
         // Safe entry into sterilizing: heater OFF, arm PID fresh
         digitalWrite(RELAY_HEATER, RELAY_OFF);
         ssrOn = false;
@@ -492,12 +547,8 @@ void loop() {
 
     // 1. Sterilizing floor — legal minimum check
     if (tempC < TARGET_TEMP_C || pressurePsi < TARGET_PSI) {
-      Serial.print("EMERGENCY: Sterilizing floor breached! T=");
-      Serial.print(tempC, 1);
-      Serial.print("C / P=");
-      Serial.print(pressurePsi, 2);
-      Serial.println(
-          " PSI — below legal minimum. Stopping & awaiting manual reset.");
+      telemetry.hasEmergency = true;
+      telemetry.emergencyReason = "STERILIZING FLOOR BREACH";
       digitalWrite(RELAY_HEATER, RELAY_OFF);
       ssrOn = false;
       pidArmed = false;
@@ -518,7 +569,6 @@ void loop() {
 
     // 3. Hold-time complete → exhaust
     if (millis() - stateStartTime >= HOLD_TIME) {
-      Serial.println("Sterilizing hold time complete. Opening exhaust.");
       digitalWrite(RELAY_HEATER, RELAY_OFF);
       ssrOn = false;
       pidArmed = false;
@@ -542,8 +592,12 @@ void loop() {
 
   // --------------------------------------------------------------------------
   case STATE_COMPLETE:
-    Serial.println(
-        "[SUCCESS] Cycle complete. Chamber depressurised. Unlocking door.");
+    // Final telemetry snapshot, then emit the single JSON for the cycle
+    telemetry.state = stateName(currentState);
+    telemetry.tempC = tempC;
+    telemetry.pressurePsi = pressurePsi;
+    telemetry.hasWater = hasWater;
+    printTelemetryJson();
     digitalWrite(RELAY_DOOR_LOCK, RELAY_OFF);
     currentState = STATE_IDLE;
     break;
@@ -559,16 +613,13 @@ void loop() {
     // Keep door locked until chamber pressure is safe
     digitalWrite(RELAY_DOOR_LOCK, (pressurePsi > 1.0) ? RELAY_ON : RELAY_OFF);
 
-    {
-      static unsigned long lastEmergencyAlert = 0;
-      if (millis() - lastEmergencyAlert > 2000) {
-        Serial.println("!! EMERGENCY SHUTDOWN — Manual reset required. !!");
-        lastEmergencyAlert = millis();
-      }
-    }
-
     if (digitalRead(btnResetPin) == LOW) {
-      Serial.println("Reset pressed. Returning to IDLE.");
+      // Emit the single JSON for the aborted cycle
+      telemetry.state = stateName(currentState);
+      telemetry.tempC = tempC;
+      telemetry.pressurePsi = pressurePsi;
+      telemetry.hasWater = hasWater;
+      printTelemetryJson();
       // Clear purge sub-state so a fresh cycle starts cleanly
       purgePhase = 0;
       ssrOn = false;
@@ -580,105 +631,82 @@ void loop() {
   }
 
   // ===========================================================================
-  // TELEMETRY  (1 Hz)
+  // TELEMETRY  (every 2 s) — fill the single JSON structure and print it live
   // ===========================================================================
   static unsigned long lastTelemetryTime = 0;
-  if (millis() - lastTelemetryTime >= 1000) {
+  if (millis() - lastTelemetryTime >= 2000) {
     lastTelemetryTime = millis();
 
-    Serial.print("T: ");
-    Serial.print(tempC, 1);
-    Serial.print("C | P: ");
-    Serial.print(pressurePsi, 2);
-    Serial.print(" PSI | Water: ");
-    Serial.print(hasWater ? "OK" : "EMPTY");
-    Serial.print(" | ");
+    // Always-populated fields
+    telemetry.state = stateName(currentState);
+    telemetry.tempC = tempC;
+    telemetry.pressurePsi = pressurePsi;
+    telemetry.hasWater = hasWater;
 
     unsigned long elapsed = millis() - stateStartTime;
 
     switch (currentState) {
     case STATE_IDLE:
-      Serial.println("Waiting for START button");
+    case STATE_COMPLETE:
+      // Door unlocked
+      telemetry.doorLocked = false;
       break;
 
     case STATE_CHECK_WATER:
-      Serial.println("Checking water level...");
+    case STATE_LOCK_DOOR:
+    case STATE_PURGE:
+    case STATE_STERILIZING:
+    case STATE_EXHAUST:
+      // Door locked for the entire active cycle
+      telemetry.doorLocked = true;
       break;
 
-    case STATE_LOCK_DOOR: {
-      unsigned long rem = (elapsed < 2000) ? (2000 - elapsed) / 1000 : 0;
-      Serial.print("Locking door... ");
-      Serial.print(rem);
-      Serial.println("s left");
+    case STATE_EMERGENCY_SHUTDOWN:
+      // Door stays locked until pressure is safe
+      telemetry.doorLocked = (pressurePsi > 1.0);
       break;
     }
 
+    // Stage-specific fields
+    switch (currentState) {
+    case STATE_IDLE:
+    case STATE_CHECK_WATER:
+      // No stage-specific fields
+      break;
+
+    case STATE_LOCK_DOOR:
+      // No stage-specific fields
+      break;
+
     case STATE_PURGE: {
-      if (purgePhase < VACUUM_PULSE_COUNT * 2) {
-        bool isVacuumPhase = (purgePhase % 2 == 0);
-        Serial.print("Purge Pulse ");
-        Serial.print(purgeCurrentPulse(purgePhase));
-        Serial.print("/");
-        Serial.print(VACUUM_PULSE_COUNT);
-        Serial.print(" [");
-        Serial.print(purgePhaseName(purgePhase));
-        if (isVacuumPhase) {
-          Serial.print("  P:");
-          Serial.print(pressurePsi, 2);
-          Serial.print(" / target ");
-          Serial.print(VACUUM_TARGET_PSI, 1);
-          Serial.print(" PSI");
-        } else {
-          Serial.print("  T:");
-          Serial.print(tempC, 1);
-          Serial.print(" / target ");
-          Serial.print(TARGET_TEMP_C, 1);
-          Serial.print("C");
-        }
-        Serial.println("]");
-      } else {
-        Serial.print("Purge: awaiting target  T>=");
-        Serial.print(TARGET_TEMP_C, 1);
-        Serial.print("C  P>=");
-        Serial.print(TARGET_PSI, 1);
-        Serial.println(" PSI");
-      }
+      telemetry.hasPurge = true;
+      telemetry.purgePhase = purgePhase;
+      telemetry.purgePhaseName = purgePhaseName(purgePhase);
+      telemetry.purgePulse = purgeCurrentPulse(purgePhase);
+      telemetry.vacuumTargetPsi = VACUUM_TARGET_PSI;
+      telemetry.steamTargetTempC = TARGET_TEMP_C;
       break;
     }
 
     case STATE_STERILIZING: {
-      unsigned long holdRemaining =
+      telemetry.hasSterilizing = true;
+      telemetry.pidOutput = pidOutput;
+      telemetry.ssrOn = ssrOn;
+      telemetry.pidSetpoint = STERILIZE_SETPOINT_C;
+      telemetry.filteredTempC = filteredTempC;
+      telemetry.holdRemaining =
           (elapsed < HOLD_TIME) ? (HOLD_TIME - elapsed) / 1000 : 0;
-      Serial.print("Sterilizing [Heater:");
-      Serial.print(ssrOn ? "ON " : "OFF");
-      Serial.print("  PID:");
-      Serial.print(pidOutput, 0);
-      Serial.print("%  set:");
-      Serial.print(STERILIZE_SETPOINT_C, 1);
-      Serial.print("C  T:");
-      Serial.print(filteredTempC, 1);
-      Serial.print("C  floor:");
-      Serial.print(TARGET_TEMP_C, 0);
-      Serial.print("C/");
-      Serial.print(TARGET_PSI, 0);
-      Serial.print("PSI]  hold:");
-      Serial.print(holdRemaining);
-      Serial.println("s left");
       break;
     }
 
     case STATE_EXHAUST:
-      Serial.println("Exhausting... Waiting for <= 1.0 PSI");
-      break;
-
     case STATE_COMPLETE:
-      Serial.println("Cycle complete! Unlocking door...");
-      break;
-
     case STATE_EMERGENCY_SHUTDOWN:
-      Serial.println(
-          "EMERGENCY! Awaiting RESET button (door locked until <= 1.0 PSI)");
+      // No stage-specific fields
       break;
     }
+
+    // Live telemetry print every 2 s so the operator isn't running blind
+    printTelemetryJson();
   }
 }
