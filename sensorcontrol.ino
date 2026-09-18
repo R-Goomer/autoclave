@@ -68,7 +68,7 @@ const int TEMP_FILTER_WINDOW = 5;
 // Three alternating cycles of:  vacuum pull  →  heater-on steam inject
 // BMP180 cannot read deep vacuum (~10 kPa abs), so pulse depth is enforced by
 // time.
-const int VACUUM_PULSE_COUNT = 3;
+const int VACUUM_PULSE_COUNT = 1;
 // Sensor-based purge: vacuum pull ends when gauge pressure reaches this value
 // (or deeper). Pot simulates -2 to +30 PSI gauge; -0.8 PSI ≈ light vacuum.
 const float VACUUM_TARGET_PSI = -0.8;
